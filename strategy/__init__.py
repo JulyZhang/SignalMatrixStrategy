@@ -1,0 +1,1 @@
+"""Signal Matrix Strategy Package"""

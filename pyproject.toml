@@ -1,0 +1,14 @@
+[project]
+name = "signal-matrix-strategy"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "pytest>=7.0",
+    "akshare>=1.12",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
