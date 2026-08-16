@@ -10,6 +10,7 @@
 import pandas as pd
 from strategy.utils.indicators import calc_ema, calc_macd, calc_macd_hist_mean_abs
 from strategy.utils.atr import calc_atr
+from strategy.indicators.smc import detect_mss_within_window
 
 
 def calc_c_weekly(weekly_close: pd.Series, weekly_volume: pd.Series = None) -> float:
@@ -113,6 +114,8 @@ def calc_chanlun_gate(
     daily_close: pd.Series,
     weekly_volume: pd.Series = None,
     buy_point: str = "二买",
+    ohlc_recent: pd.DataFrame = None,
+    atr_30: float = 1.0,
 ) -> dict:
     """缠论门控主入口
 
@@ -120,6 +123,10 @@ def calc_chanlun_gate(
     - C_缠论: float
     - 否决: bool
     - Scene_Snapshot: str
+
+    增强参数：
+        ohlc_recent: 最近 N 根 K 线（含 OHLC），用于增强 3 的 MSS 时效检查
+        atr_30: 30 分钟 ATR（用于 MSS 时效判断）
     """
     # 阶段 1：前置过滤
     if scene == "中阴态":
@@ -138,6 +145,13 @@ def calc_chanlun_gate(
     }
     if buy_point not in buy_point_allowed.get(scene, []):
         return {"C_缠论": 0.0, "否决": True, "Scene_Snapshot": scene}
+
+    # 阶段 4：入场级 MSS 时效（增强 3）
+    # 一买不限 MSS（底部反转 MSS 滞后），三买/类三买不限 MSS
+    # 仅二买/类二买要求 MSS 在最近 5 根 K 线内
+    if ohlc_recent is not None and buy_point in ("二买", "类二买"):
+        if not detect_mss_within_window(ohlc_recent, atr_30, buy_point, window=5):
+            return {"C_缠论": 0.0, "否决": True, "Scene_Snapshot": scene}
 
     c_daily = calc_c_daily(daily_close, buy_point)
 

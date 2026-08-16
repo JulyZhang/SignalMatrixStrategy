@@ -32,6 +32,44 @@ def detect_mss_bullish(closes: pd.Series, highs: pd.Series, atr_30: float,
     return bool(cond_a or cond_b)
 
 
+def detect_mss_within_window(ohlc: pd.DataFrame, atr_30: float,
+                              buy_point: str = "二买", window: int = 5) -> bool:
+    """MSS 时效检测（增强 3）
+
+    二买/类二买要求 MSS 在最近 window 根 K 线内确认；
+    一买不限（底部反转，MSS 往往滞后于价格低点）。
+    三买/类三买保持现有不限 MSS 逻辑。
+
+    Args:
+        ohlc: K 线 DataFrame（含 open/high/low/close）
+        atr_30: 30 分钟 ATR
+        buy_point: 当前买点类型
+        window: 时效窗口（默认 5 根 K 线）
+
+    Returns:
+        True if MSS 在时效窗口内 OR buy_point 是其他不限 MSS 的买点
+        False if MSS 超时 AND buy_point 是二买/类二买
+    """
+    # 一买不限 MSS（底部反转，MSS 滞后）
+    if buy_point == "一买":
+        return True
+
+    # 二买/类二买要求 MSS 在 window 根 K 线内
+    if buy_point in ("二买", "类二买"):
+        recent = ohlc.tail(window)
+        if len(recent) < 2:
+            return False
+        closes = recent["close"]
+        highs = recent["high"]
+        prev_high = highs.iloc[:-1].max()
+        cond_a = (closes.iloc[-1] > prev_high) and (closes.iloc[-2] > prev_high)
+        cond_b = (closes.iloc[-1] - prev_high) >= 0.5 * atr_30
+        return bool(cond_a or cond_b)
+
+    # 三买/类三买/类一买：保持现有逻辑（不限 MSS）
+    return True
+
+
 def detect_ob_bullish(ohlc: pd.DataFrame, mss_occurred: bool = True) -> dict | None:
     """OB 做多识别（漏洞 K 时效衰减 + 微瑕 4 震荡市豁免）"""
     if not mss_occurred or len(ohlc) < 5:

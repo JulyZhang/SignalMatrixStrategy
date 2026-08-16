@@ -39,12 +39,26 @@ def run_strategy_on_bar(
     scene = recognize_scene(daily_close, weekly_close)
 
     # 2. 缠论门控
+    # 计算 ATR_30min（先用于 MSS 时效，也用于 SMC）
+    atr_30 = calc_atr(daily_high, daily_low, daily_close, 14).iloc[-1]
+    atr_30 = max(atr_30, 0.001)  # 漏洞 I 零值保护
+
+    # 增强 3：构造最近 5 根 K 线（用于 MSS 时效检测，仅二买/类二买强制）
+    ohlc_recent = pd.DataFrame({
+        "open": daily_open,
+        "high": daily_high,
+        "low": daily_low,
+        "close": daily_close,
+    }).tail(5)
+
     chanlun_result = calc_chanlun_gate(
         scene=scene,
         weekly_close=weekly_close,
         daily_close=daily_close,
         weekly_volume=weekly_volume,
         buy_point=buy_point,
+        ohlc_recent=ohlc_recent,   # 增强 3
+        atr_30=atr_30,             # 增强 3
     )
     if chanlun_result["否决"]:
         return None
@@ -56,9 +70,6 @@ def run_strategy_on_bar(
     close = daily_close
     open_ = daily_open
 
-    # 计算 ATR_30min（简化：用日线代替）
-    atr_30 = calc_atr(high, low, close, 14).iloc[-1]
-
     smc_result = calc_c_smc(
         ohlc=pd.DataFrame({
             "open": open_,
@@ -67,18 +78,20 @@ def run_strategy_on_bar(
             "close": close,
         }),
         scene=scene,
-        atr_30=max(atr_30, 0.001),  # 漏洞 I 零值保护
+        atr_30=atr_30,  # 已在步骤 2 计算（含零值保护）
     )
 
     # 4. 传统指标
     trad_result = calc_c_traditional(close, high, low, daily_volume, scene)
 
-    # 5. 三层加权
+    # 5. 三层加权（增强 1 + 增强 2：传入 current_price 和 daily_close）
     weighted = calc_weighted_score(
         scene=scene,
         C_缠论=chanlun_result["C_缠论"],
         C_SMC=smc_result["C_SMC"],
         C_传统=trad_result["C_传统"],
+        current_price=current_bar["close"],   # 增强 1 + 增强 2
+        daily_close=daily_close,               # 增强 1 + 增强 2
     )
     if weighted["否决"]:
         return None
