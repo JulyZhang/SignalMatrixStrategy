@@ -7,10 +7,22 @@
 4. 入场级 60+30 分钟
 5. 最终评分 sqrt(C_周 × C_日)
 """
+from dataclasses import dataclass
 import pandas as pd
 from strategy.utils.indicators import calc_ema, calc_macd, calc_macd_hist_mean_abs
 from strategy.utils.atr import calc_atr
 from strategy.indicators.smc import detect_mss_within_window
+
+
+@dataclass
+class Zhongshu:
+    """缠论中枢"""
+    start_idx: int          # 在原始价格序列中的起始索引
+    end_idx: int            # 结束索引
+    high: float             # ZG（中枢上沿）
+    low: float              # ZD（下沿）
+    direction: str          # 'up' (上升中枢) 或 'down' (下降中枢)
+    type: str               # 'extension' (延伸) / 'new' (新中枢)
 
 
 def calc_c_weekly(weekly_close: pd.Series, weekly_volume: pd.Series = None) -> float:
@@ -106,6 +118,289 @@ def calc_c_daily(daily_close: pd.Series, buy_point: str = "二买") -> float:
         macd_pos_score = max(0, 1 + hist.iloc[-1] / denom)
 
     return 0.4 * structure_score + 0.3 * clarity_score + 0.3 * macd_pos_score
+
+
+def _process_inclusion(highs: pd.Series, lows: pd.Series) -> pd.DataFrame:
+    """处理 K 线包含关系，返回简化序列
+
+    规则（向上走势）：
+        若 i-1 的高点 ≤ i 的高点 AND i-1 的低点 ≥ i 的低点
+        → i-1 被 i 包含，删除 i-1
+
+    规则（向下走势）：
+        若 i-1 的高点 ≥ i 的高点 AND i-1 的低点 ≤ i 的低点
+        → i-1 被 i 包含，删除 i-1
+
+    Returns:
+        DataFrame with columns: high, low (索引对应原始 K 线位置)
+    """
+    n = len(highs)
+    if n < 3:
+        return pd.DataFrame({'high': highs, 'low': lows}, index=list(range(n)))
+
+    # 初始方向假设：向上
+    highs_arr = list(highs)
+    lows_arr = list(lows)
+    keep = [True] * n   # 是否保留
+
+    direction = 'up'   # 初始向上
+
+    i = 2
+    while i < n:
+        if not keep[i-1]:
+            i += 1
+            continue
+
+        prev_high, prev_low = highs_arr[i-1], lows_arr[i-1]
+        curr_high, curr_low = highs_arr[i], lows_arr[i]
+
+        if direction == 'up':
+            # 上升：curr 包含 prev
+            if curr_high >= prev_high and curr_low <= prev_low:
+                keep[i-1] = False   # 删除 prev
+                # 不增加 i（下次检查相同位置）
+                continue
+            elif curr_high < prev_high and curr_low > prev_low:
+                # 当前 K 线被前一根包含
+                keep[i] = False
+                i += 1
+                continue
+            elif curr_high < prev_high:
+                # 当前 K 线高点 < 前一 K 线高点，方向可能反转
+                direction = 'down'
+        else:
+            # 下降：prev 包含 curr
+            if curr_high <= prev_high and curr_low >= prev_low:
+                keep[i-1] = False
+                continue
+            elif curr_high > prev_high and curr_low < prev_low:
+                # 当前 K 线包含前一根
+                keep[i] = False
+                i += 1
+                continue
+            elif curr_low > prev_low:
+                direction = 'up'
+        i += 1
+
+    # 构建简化序列
+    result_highs = []
+    result_lows = []
+    result_indices = []
+    for idx in range(n):
+        if keep[idx]:
+            result_highs.append(highs_arr[idx])
+            result_lows.append(lows_arr[idx])
+            result_indices.append(idx)
+
+    return pd.DataFrame({
+        'high': result_highs,
+        'low': result_lows,
+    }, index=result_indices)
+
+
+def _find_fractals(simplified: pd.DataFrame) -> pd.DataFrame:
+    """在简化序列上识别顶/底分型（独立判定，标准缠论定义）
+
+    顶分型：中K 高点 ≥ 左侧高点 AND 高点 ≥ 右侧高点（只看高点）
+    底分型：中K 低点 ≤ 左侧低点 AND 低点 ≤ 右侧低点（只看低点）
+
+    修复：之前是合并判定（中K同时高点最高+低点最低），过严导致识别太少
+    """
+    if len(simplified) < 3:
+        return pd.DataFrame(columns=['idx', 'type', 'high', 'low'])
+
+    fractals = []
+    for i in range(1, len(simplified) - 1):
+        prev = simplified.iloc[i-1]
+        curr = simplified.iloc[i]
+        next_ = simplified.iloc[i+1]
+
+        # 顶分型：只看高点（标准缠论）
+        if curr['high'] >= prev['high'] and curr['high'] >= next_['high']:
+            fractals.append({
+                'idx': simplified.index[i],
+                'type': 'top',
+                'high': curr['high'],
+                'low': curr['low'],
+            })
+        # 底分型：只看低点（标准缠论）
+        elif curr['low'] <= prev['low'] and curr['low'] <= next_['low']:
+            fractals.append({
+                'idx': simplified.index[i],
+                'type': 'bottom',
+                'high': curr['high'],
+                'low': curr['low'],
+            })
+
+    return pd.DataFrame(fractals)
+
+
+def _find_segments(fractals: pd.DataFrame, min_bars: int = 5) -> list:
+    """从分型序列识别笔
+
+    笔 = 底分型 → 顶分型（上升）或 顶分型 → 底分型（下降）
+    中间至少 5 根 K 线（min_bars）
+
+    Returns:
+        List of segments: [{start_idx, end_idx, start_type, end_type, high, low}]
+    """
+    if len(fractals) < 2:
+        return []
+
+    segments = []
+    for i in range(len(fractals) - 1):
+        f1 = fractals.iloc[i]
+        f2 = fractals.iloc[i + 1]
+
+        # 必须交替（底→顶 或 顶→底）
+        if f1['type'] == f2['type']:
+            continue
+
+        # 中间至少 min_bars 根
+        if f2['idx'] - f1['idx'] < min_bars:
+            continue
+
+        # 上升笔（底→顶）：end 高于 start
+        # 下降笔（顶→底）：end 低于 start
+        if f1['type'] == 'bottom' and f2['high'] > f1['high']:
+            segments.append({
+                'start_idx': f1['idx'],
+                'end_idx': f2['idx'],
+                'start_type': 'bottom',
+                'end_type': 'top',
+                'high': f2['high'],
+                'low': f1['low'],
+            })
+        elif f1['type'] == 'top' and f2['low'] < f1['low']:
+            segments.append({
+                'start_idx': f1['idx'],
+                'end_idx': f2['idx'],
+                'start_type': 'top',
+                'end_type': 'bottom',
+                'high': f1['high'],
+                'low': f2['low'],
+            })
+
+    return segments
+
+
+def _find_zhongshus(segments: list) -> list:
+    """从笔序列识别中枢
+
+    中枢 = 连续 3 笔（上升-下降-上升 或 下降-上升-下降）的重叠区间
+
+    Returns:
+        List of Zhongshu
+    """
+    if len(segments) < 3:
+        return []
+
+    zhongshus = []
+    i = 0
+    while i <= len(segments) - 3:
+        s1, s2, s3 = segments[i], segments[i+1], segments[i+2]
+
+        # 形态：s1↑s2↓s3↑ 或 s1↓s2↑s3↓
+        direction_ok = (
+            (s1['end_type'] == 'top' and s2['end_type'] == 'bottom' and s3['end_type'] == 'top') or
+            (s1['end_type'] == 'bottom' and s2['end_type'] == 'top' and s3['end_type'] == 'bottom')
+        )
+        if not direction_ok:
+            i += 1
+            continue
+
+        # 重叠区间
+        # 上升中枢：max(s1.low, s2.low, s3.low) ≤ min(s1.high, s2.high, s3.high)
+        # ZG = min(三个 high), ZD = max(三个 low)
+        highs = [s1['high'], s2['high'], s3['high']]
+        lows = [s1['low'], s2['low'], s3['low']]
+
+        ZG = min(highs)
+        ZD = max(lows)
+
+        if ZG <= ZD:   # 必须有重叠
+            i += 1
+            continue
+
+        direction = 'up' if s1['end_type'] == 'bottom' else 'down'
+
+        zhongshus.append(Zhongshu(
+            start_idx=s1['start_idx'],
+            end_idx=s3['end_idx'],
+            high=ZG,
+            low=ZD,
+            direction=direction,
+            type='new',
+        ))
+
+        # 中枢可延伸：下一笔如果与当前中枢重叠，可扩展
+        j = i + 3
+        while j < len(segments):
+            next_seg = segments[j]
+            # 检查是否与当前中枢重叠
+            if max(next_seg['low'], ZD) <= min(next_seg['high'], ZG):
+                # 延伸：更新 end_idx 和高低点
+                ZG = min(ZG, next_seg['high'])
+                ZD = max(ZD, next_seg['low'])
+                zhongshus[-1] = Zhongshu(
+                    start_idx=zhongshus[-1].start_idx,
+                    end_idx=next_seg['end_idx'],
+                    high=ZG,
+                    low=ZD,
+                    direction=direction,
+                    type='extension',
+                )
+                j += 1
+            else:
+                break
+
+        i = j   # 跳过已用笔
+
+    return zhongshus
+
+
+def detect_zhongshu(highs: pd.Series, lows: pd.Series, lookback: int = 120) -> list:
+    """缠论中枢识别（使用真实 OHLC）
+
+    算法：
+    1. 处理包含关系 → 特征序列
+    2. 识别顶/底分型
+    3. 识别笔（≥5 根 K 线）
+    4. 识别中枢（连续 3 笔重叠区间）
+
+    Args:
+        highs: 最高价序列
+        lows: 最低价序列
+        lookback: 最大回看窗口（默认 120 根 K 线 ≈ 半年）
+
+    Returns:
+        中枢列表，按时间正序
+
+    Raises:
+        ValueError: highs 和 lows 长度不一致
+    """
+    if len(highs) != len(lows):
+        raise ValueError("highs 和 lows 长度必须一致")
+    if len(highs) < 20:
+        return []
+
+    # 取最近 lookback 根
+    h = highs.tail(lookback).reset_index(drop=True)
+    l = lows.tail(lookback).reset_index(drop=True)
+
+    # Step 1: 包含关系
+    simplified = _process_inclusion(h, l)
+
+    # Step 2: 分型
+    fractals = _find_fractals(simplified)
+
+    # Step 3: 笔
+    segments = _find_segments(fractals, min_bars=5)
+
+    # Step 4: 中枢
+    zhongshus = _find_zhongshus(segments)
+
+    return zhongshus
 
 
 def calc_chanlun_gate(
