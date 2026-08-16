@@ -3,6 +3,9 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import csv
+from datetime import datetime
+
 import pandas as pd
 from strategy.data.loader import load_stock_csv
 from strategy.main import run_strategy_on_bar
@@ -12,6 +15,51 @@ def load_universe_data(symbol: str, data_dir: str = "backtest_data") -> pd.DataF
     """加载单只股票数据"""
     csv_path = os.path.join(data_dir, f"stk_{symbol}.csv")
     return load_stock_csv(csv_path)
+
+
+def export_trades_csv(trades, output_dir: str = "./results"):
+    """导出所有信号到带时间戳的 CSV（默认写到 ./results/）"""
+    os.makedirs(output_dir, exist_ok=True)   # 新增：自动建目录
+
+    if not trades:
+        return None
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = os.path.join(output_dir, f"signals_{timestamp}.csv")
+
+    fieldnames = [
+        "symbol", "date", "scene", "confidence", "confidence_tier",
+        "entry_price", "stop_loss", "tp1", "tp2", "tp3",
+        "risk_reward_ratio", "expected_value", "entry_strategy",
+        "buy_point", "C_缠论", "C_SMC", "C_传统",
+    ]
+
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for t in trades:
+            card = t["card"]
+            writer.writerow({
+                "symbol": t["symbol"],
+                "date": t["date"],
+                "scene": card.scene,
+                "confidence": card.confidence,
+                "confidence_tier": card.confidence_tier,
+                "entry_price": card.entry_price,
+                "stop_loss": card.stop_loss,
+                "tp1": card.tp1,
+                "tp2": card.tp2,
+                "tp3": card.tp3,
+                "risk_reward_ratio": card.risk_reward_ratio,
+                "expected_value": card.expected_value,
+                "entry_strategy": card.entry_strategy,
+                "buy_point": card.buy_point,
+                "C_缠论": card.C_缠论,
+                "C_SMC": card.C_SMC,
+                "C_传统": card.C_传统,
+            })
+
+    return csv_path
 
 
 def main(symbols: list = None, max_bars: int = None):
@@ -80,7 +128,10 @@ def main(symbols: list = None, max_bars: int = None):
                     "card": card,
                 })
 
+    csv_path = export_trades_csv(all_trades)
     print(f"\n回测完成，共生成 {len(all_trades)} 个有效信号")
+    if csv_path:
+        print(f"已导出 CSV: {csv_path}")
     return all_trades
 
 
