@@ -25,6 +25,17 @@ class Zhongshu:
     type: str               # 'extension' (延伸) / 'new' (新中枢)
 
 
+@dataclass
+class BuyPoint:
+    """缠论买点"""
+    type: str              # '一买' / '二买' / '三买' / '类二买' / '类三买'
+    idx: int               # 原始序列中的索引
+    price: float           # 入场价（建议用当前 close 或 high）
+    confidence: float      # 0-1 置信度
+    reason: str            # 触发原因描述
+    extra: dict = None     # 附加信息（如一买时的低点、二买时的一买 idx）
+
+
 def calc_c_weekly(weekly_close: pd.Series, weekly_volume: pd.Series = None) -> float:
     """阶段 2：C_周 计算
 
@@ -401,6 +412,196 @@ def detect_zhongshu(highs: pd.Series, lows: pd.Series, lookback: int = 120) -> l
     zhongshus = _find_zhongshus(segments)
 
     return zhongshus
+
+
+# === 缠论买点检测（一买/二买/三买） ===
+
+def _is_macd_bottom_divergence(closes: pd.Series, lows: pd.Series, lookback: int = 60) -> bool:
+    """检测 MACD 底背离
+
+    条件：
+    1. 最近 20 根内出现新的最低价（低于前 40 根的最低价）
+    2. MACD_hist 在新低点位置的值 > 在前低点位置的值
+    """
+    if len(closes) < lookback:
+        return False
+
+    _, _, hist = calc_macd(closes)
+
+    recent_low_idx = lows.tail(20).idxmin()
+    prev_low_idx = lows.iloc[-lookback:-20].idxmin()
+
+    if lows.loc[recent_low_idx] >= lows.loc[prev_low_idx]:
+        return False   # 没有新低
+
+    # MACD_hist 在新低点位置更高 → 底背离
+    hist_recent = hist.loc[recent_low_idx]
+    hist_prev = hist.loc[prev_low_idx]
+
+    return hist_recent > hist_prev
+
+
+def _is_macd_golden_cross(hist: pd.Series, lookback: int = 10) -> bool:
+    """检测 MACD 金叉（hist 由负转正）
+
+    在最近 lookback 根内，MACD_hist 由 < 0 穿越到 >= 0
+    """
+    if len(hist) < lookback:
+        return False
+
+    recent = hist.tail(lookback).values
+    for i in range(1, len(recent)):
+        if recent[i-1] < 0 and recent[i] >= 0:
+            return True
+    return False
+
+
+def _is_volume_amplified(volumes: pd.Series, lookback: int = 20) -> bool:
+    """检测放量（当前成交量 > 1.5 倍近 5 日均量）"""
+    if volumes is None or len(volumes) < lookback:
+        return False
+
+    current_vol = volumes.iloc[-1]
+    avg_vol_5 = volumes.iloc[-6:-1].mean() if len(volumes) >= 6 else volumes.mean()
+
+    if avg_vol_5 <= 0:
+        return False
+    return current_vol >= avg_vol_5 * 1.5
+
+
+def detect_buy_point(
+    highs: pd.Series,
+    lows: pd.Series,
+    closes: pd.Series,
+    volumes: pd.Series = None,
+    zhongshus: list = None,
+    state: dict = None,
+    lookback: int = 120,
+) -> tuple:
+    """缠论买点检测（一买/二买/三买）
+
+    检测流程：
+    1. 计算 MACD（用 strategy.utils.indicators.calc_macd）
+    2. 计算 MACD 底背离信号（价格新低 + MACD_hist 不新低）
+    3. 检查是否满足"至少 2 个中枢"（一买前提）
+    4. 一买成立 → 写入 state
+    5. 二买检测：当前价回踩到 state 中上次一买低点附近 + MACD 金叉
+    6. 三买检测：突破最近中枢上沿 + 当前价未跌回中枢 + 放量
+
+    Args:
+        highs: 最高价
+        lows: 最低价
+        closes: 收盘价
+        volumes: 成交量（可选，用于放量检测）
+        zhongshus: 已识别的中枢列表（None 时自动用 detect_zhongshu）
+        state: 状态机 dict（首次调用传 None，内部自动管理）
+        lookback: 回看窗口（默认 120 根）
+
+    Returns:
+        (BuyPoint | None, new_state)
+        BuyPoint: 找到的买点（None 表示没找到）
+        new_state: 更新后的状态机（下次调用继续传）
+    """
+    if state is None:
+        state = {"last_one_buy_idx": -1, "last_one_buy_low": float('inf')}
+
+    if zhongshus is None:
+        zhongshus = detect_zhongshu(highs, lows, lookback)
+
+    # 工作窗口（最近 lookback 根）
+    h = highs.tail(lookback).reset_index(drop=True)
+    l = lows.tail(lookback).reset_index(drop=True)
+    c = closes.tail(lookback).reset_index(drop=True)
+    n = len(c)
+    if n < 60:
+        return None, state
+
+    # === 一买检测 ===
+    # 条件: 至少 2 个中枢 + MACD 底背离 + 价格新低
+    if len(zhongshus) >= 2 and _is_macd_bottom_divergence(c, l, lookback=60):
+        # 找到最近的价格最低点
+        recent_low_idx = l.tail(20).idxmin()
+        recent_low = l.iloc[recent_low_idx]
+
+        buy_point = BuyPoint(
+            type='一买',
+            idx=h.index[-1] - (n - 1 - recent_low_idx),  # 原始索引
+            price=recent_low,
+            confidence=0.7,
+            reason=f'一买：MACD 底背离 + 价格新低（{recent_low:.2f}）+ {len(zhongshus)} 个中枢',
+            extra={'low_idx': recent_low_idx, 'low_price': recent_low}
+        )
+
+        # 更新状态机
+        state["last_one_buy_idx"] = buy_point.idx
+        state["last_one_buy_low"] = recent_low
+
+        return buy_point, state
+
+    # === 二买检测（需要状态机有上次一买位置）===
+    last_one_buy_idx = state.get("last_one_buy_idx", -1)
+    last_one_buy_low = state.get("last_one_buy_low", float('inf'))
+
+    if last_one_buy_idx >= 0:
+        _, _, hist = calc_macd(c)
+
+        # 二买条件：
+        # 1. 当前低点回踩到上次一买低点附近（不破，±5%）
+        # 2. MACD_hist 在最近 10 根金叉
+        # 3. 当前价 > 一买低点（一买后反弹过）
+
+        current_low = l.iloc[-1]
+        pullback_ok = (
+            current_low < last_one_buy_low * 1.10 and
+            current_low >= last_one_buy_low * 0.95
+        )
+
+        rebound_ok = c.iloc[-1] > last_one_buy_low
+
+        macd_golden = _is_macd_golden_cross(hist, lookback=10)
+
+        if pullback_ok and rebound_ok and macd_golden:
+            buy_point = BuyPoint(
+                type='二买',
+                idx=h.index[-1],
+                price=c.iloc[-1],
+                confidence=0.75,
+                reason=f'二买：回踩不破一买低点（{last_one_buy_low:.2f}）+ MACD 金叉',
+                extra={'one_buy_idx': last_one_buy_idx, 'one_buy_low': last_one_buy_low}
+            )
+            return buy_point, state
+
+    # === 三买检测 ===
+    # 条件：
+    # 1. 最近有中枢
+    # 2. 当前价突破最近中枢上沿
+    # 3. 当前低点 >= 中枢上沿（回踩不跌回中枢）
+    # 4. 放量
+
+    if zhongshus:
+        # 找最近一个中枢（按 end_idx 排序取最后）
+        latest_zhongshu = max(zhongshus, key=lambda z: z.end_idx)
+        ZG = latest_zhongshu.high
+
+        current_close = c.iloc[-1]
+        current_low = l.iloc[-1]
+
+        broke_up = current_close > ZG           # 突破中枢上沿
+        hold_above = current_low >= ZG * 0.99   # 回踩不跌回（允许 1% 容差）
+        amplified = _is_volume_amplified(volumes, lookback=20) if volumes is not None else False
+
+        if broke_up and hold_above and amplified:
+            buy_point = BuyPoint(
+                type='三买',
+                idx=h.index[-1],
+                price=c.iloc[-1],
+                confidence=0.8,
+                reason=f'三买：突破中枢上沿（{ZG:.2f}）+ 放量 + 未跌回中枢',
+                extra={'zhongshu_end_idx': latest_zhongshu.end_idx, 'ZG': ZG}
+            )
+            return buy_point, state
+
+    return None, state
 
 
 def calc_chanlun_gate(

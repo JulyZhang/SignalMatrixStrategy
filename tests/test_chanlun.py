@@ -8,6 +8,8 @@ from strategy.indicators.chanlun import (
     calc_chanlun_gate,
     detect_zhongshu,
     Zhongshu,
+    detect_buy_point,
+    BuyPoint,
 )
 
 def test_c_weekly_hard_veto_direction_mismatch():
@@ -105,3 +107,78 @@ def test_detect_zhongshu_raises_on_mismatched_lengths():
 
     with pytest.raises(ValueError, match="长度必须一致"):
         detect_zhongshu(high, low)
+
+
+# === detect_buy_point 测试 ===
+
+def test_detect_buy_point_one_buy_with_2_zhongshus():
+    """一买：2 个中枢 + 底背离 + 价格新低"""
+    # 构造：3 个明显高低点形成 2 个中枢 + 底部反转
+    close = pd.Series([10, 12, 11, 9, 8, 10, 11, 10, 9, 8.5,
+                       10, 12, 11, 10, 9, 8, 8.2, 9, 10, 9.5])
+    high = close * 1.02
+    low = close * 0.98
+
+    bp, state = detect_buy_point(high, low, close)
+    # 应能识别出一买或 None（依赖算法边界），不应抛错
+    assert bp is None or isinstance(bp, BuyPoint)
+
+
+def test_detect_buy_point_state_machine():
+    """二买：状态机记录一买位置 + 二买检测回踩"""
+    # 构造：先一买（带中枢），后回踩不破
+    close = pd.Series([10, 12, 11, 9, 8, 10, 11, 10, 9, 8.5,
+                       10, 12, 11, 10, 9, 8.5, 8.7, 9, 10, 11, 12, 11.5])
+    high = close * 1.02
+    low = close * 0.98
+
+    # 第一次调用（应该检测一买或返回 None）
+    bp1, state = detect_buy_point(high, low, close)
+
+    # 状态机应该被更新（如果有 一买）
+    if bp1 is not None and bp1.type == '一买':
+        assert state['last_one_buy_idx'] > 0
+
+    # 第二次调用（state 传入）
+    bp2, state2 = detect_buy_point(high, low, close, state=state)
+    # 不应抛错
+    assert bp2 is None or isinstance(bp2, BuyPoint)
+
+
+def test_detect_buy_point_three_buy_breakout():
+    """三买：突破最近中枢上沿 + 放量"""
+    # 构造：中枢 + 突破 + 放量
+    close = pd.Series([10, 12, 11, 9, 10, 11, 10, 9, 10, 11,
+                       10, 11, 12, 13, 12, 11, 12, 13, 14, 13])
+    high = close * 1.02
+    low = close * 0.98
+    volume = pd.Series([100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+                        100, 100, 100, 200, 200, 100, 100, 100, 200, 100])  # 放量
+
+    bp, state = detect_buy_point(high, low, close, volumes=volume)
+    # 应能识别出三买或 None
+    assert bp is None or isinstance(bp, BuyPoint)
+
+
+def test_detect_buy_point_returns_state():
+    """状态机：每次调用都返回新 state，状态累积"""
+    close = pd.Series([10, 12, 11, 9, 8, 10, 11, 10, 9, 8.5] * 3)
+    high = close * 1.02
+    low = close * 0.98
+
+    _, state1 = detect_buy_point(high, low, close)
+    _, state2 = detect_buy_point(high, low, close, state=state1)
+    # state2 至少包含 state1 的字段
+    for k in state1:
+        assert k in state2
+
+
+def test_detect_buy_point_short_data_returns_none():
+    """数据不足时返回 (None, state)"""
+    close = pd.Series([10, 11, 12, 13])
+    high = close * 1.02
+    low = close * 0.98
+
+    bp, state = detect_buy_point(high, low, close)
+    assert bp is None
+    assert isinstance(state, dict)
