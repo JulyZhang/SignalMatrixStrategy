@@ -42,7 +42,8 @@ strategy/                       # 核心策略包
 
 scripts/
 ├── run_backtest.py             # 回测脚本（命令行入口）
-└── calc_metrics.py             # 绩效指标计算
+├── calc_metrics.py             # 绩效指标计算
+└── download_data.py            # 增量下载 A 股日线到 backtest_data/（mootdx）
 
 tests/                          # 72 个测试，覆盖 17 个任务
 backtest_data/                  # 已有历史数据（stk_*.csv）
@@ -72,6 +73,29 @@ python scripts/run_backtest.py
 # 默认：跑回测 + 打印场景/置信度分布
 python scripts/calc_metrics.py
 ```
+
+### 下载 / 增量更新历史 K 线
+
+`backtest_data/stk_*.csv` 已包含 60+ 只沪深 300/中证红利成分股的
+2010-2025 数据，新增股票或拉新数据可用：
+
+```bash
+# 下载默认 20 只股票（沪深300 + 红利成分股）
+python scripts/download_data.py
+
+# 指定股票代码
+python scripts/download_data.py --symbols 600519,000333
+
+# 重新下载 backtest_data/ 已有股票（用于数据刷新）
+python scripts/download_data.py --all
+
+# 限制拉取根数（快速测试）
+python scripts/download_data.py --symbols 600519 --offset 100
+```
+
+数据源：通达信（mootdx，TCP 协议，不封 IP）；CSV 格式与 `strategy.data`
+的 `load_stock_csv` 直接兼容。如本机无法访问通达信服务器，脚本会抛
+`RuntimeError`，可换其它网络环境重试。
 
 输出示例：
 ```
@@ -246,7 +270,7 @@ pytest tests/ --cov=strategy --cov-report=term-missing
 
 ## 10. 下一步建议
 
-- 接入实盘数据源（akshare / tushare）
+- 接入实盘数据源（akshare / tushare）；本地增量拉取可用 `scripts/download_data.py`（mootdx）
 - 实现 60/30 分钟 K 线的入场级逻辑（替换 Task 16 中的日线简化）
 - 完善 BacktestEngine.run() 的逐 K 线遍历逻辑
 - 实现 `daily_data_quality_check` 接入真实公告数据
