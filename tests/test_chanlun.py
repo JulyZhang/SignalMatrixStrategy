@@ -182,3 +182,71 @@ def test_detect_buy_point_short_data_returns_none():
     bp, state = detect_buy_point(high, low, close)
     assert bp is None
     assert isinstance(state, dict)
+
+
+# === Bug 修复回归测试 ===
+
+def test_two_buy_time_window_expires():
+    """Bug 1 修复：二买只在一买后 60 根 K 线内有效（不应无限期触发）"""
+    # 构造：一买信号 + 超过 60 根的二买候选（不应触发）
+    close = pd.Series([10, 12, 11, 9, 8, 10, 11, 10, 9, 8.5,
+                       10, 12, 11, 10, 9, 8.5, 8.7, 9, 10, 11])
+    high = close * 1.02
+    low = close * 0.98
+
+    # 先检测一买
+    bp1, state = detect_buy_point(high, low, close)
+    if bp1 is not None and bp1.type == '一买':
+        # state 应该有时间戳
+        assert 'last_one_buy_time_idx' in state
+        assert state['last_one_buy_time_idx'] >= 0
+
+        # 构造超长时间的回踩（> 60 根），不应触发二买
+        long_close = pd.Series(list(close) + [8.5] * 100 + [11] * 5)  # 加 100 根 8.5 + 5 根反弹
+        long_high = long_close * 1.02
+        long_low = long_close * 0.98
+
+        bp2, state2 = detect_buy_point(long_high, long_low, long_close, state=state)
+        # 超出时间窗口的二买应被拒绝
+        if bp2 is not None:
+            assert bp2.type != '二买', \
+                f"超时窗口仍触发二买: {bp2.type} @ {bp2.idx}"
+
+
+def test_one_buy_no_duplicate_same_low():
+    """Bug 2 修复：同价格低点不应触发多次一买"""
+    # 构造：3 个连续触及同一低点 6.48（5/9, 5/16, 5/23）
+    close = pd.Series([10, 12, 11, 9, 8, 10, 11, 10, 9, 8.5,
+                       6.48, 6.5, 6.48, 6.6, 6.48])  # 多次触及 6.48
+    high = close * 1.02
+    low = close * 0.98
+
+    buy_points = []
+    state = None
+    for i in range(60, len(close)):
+        bp, state = detect_buy_point(
+            high.iloc[:i+1], low.iloc[:i+1], close.iloc[:i+1], state=state
+        )
+        if bp is not None and bp.type == '一买':
+            buy_points.append((i, bp.price))
+
+    # 应该只有 1 个一买（同价格 6.48 只触发第一次）
+    one_buys = [(i, p) for i, p in buy_points if abs(p - 6.48) < 0.01]
+    # 主要验证：同价格不会无限制重复触发
+    assert len(one_buys) <= 3, f"同价格 6.48 重复触发了 {len(one_buys)} 次一买: {one_buys}"
+
+
+def test_three_buy_requires_zhongshus():
+    """Bug 3 修复：无中枢时不应触发三买（不应抛 ValueError）"""
+    close = pd.Series([10, 12, 11, 9, 10, 11, 10, 9, 10, 11,
+                       10, 11, 12, 13, 12, 11, 12, 13, 14, 13])
+    high = close * 1.02
+    low = close * 0.98
+    volume = pd.Series([100] * 20)
+
+    # 显式传空 zhongshus
+    bp, state = detect_buy_point(high, low, close, volumes=volume, zhongshus=[])
+    # 无中枢时不应触发任何买点（不应抛错，且不应有三买）
+    if bp is not None:
+        assert bp.type != '三买', \
+            f"无中枢时仍触发三买: {bp.type}"

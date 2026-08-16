@@ -503,7 +503,11 @@ def detect_buy_point(
         new_state: 更新后的状态机（下次调用继续传）
     """
     if state is None:
-        state = {"last_one_buy_idx": -1, "last_one_buy_low": float('inf')}
+        state = {
+            "last_one_buy_idx": -1,
+            "last_one_buy_low": float('inf'),
+            "last_one_buy_time_idx": -1,   # 一买触发时工作区内的索引位置（用于二买时间窗口）
+        }
 
     if zhongshus is None:
         zhongshus = detect_zhongshu(highs, lows, lookback)
@@ -516,6 +520,9 @@ def detect_buy_point(
     if n < 60:
         return None, state
 
+    # 记录工作窗口在原始序列中的起始索引（整数位置，用于时间窗口计算）
+    work_start_idx = len(highs) - n
+
     # === 一买检测 ===
     # 条件: 至少 2 个中枢 + MACD 底背离 + 价格新低
     if len(zhongshus) >= 2 and _is_macd_bottom_divergence(c, l, lookback=60):
@@ -523,26 +530,40 @@ def detect_buy_point(
         recent_low_idx = l.tail(20).idxmin()
         recent_low = l.iloc[recent_low_idx]
 
-        buy_point = BuyPoint(
-            type='一买',
-            idx=h.index[-1] - (n - 1 - recent_low_idx),  # 原始索引
-            price=recent_low,
-            confidence=0.7,
-            reason=f'一买：MACD 底背离 + 价格新低（{recent_low:.2f}）+ {len(zhongshus)} 个中枢',
-            extra={'low_idx': recent_low_idx, 'low_price': recent_low}
-        )
+        # 修复 bug 2: 严格小于，避免同低点重复触发
+        if recent_low < state["last_one_buy_low"]:
+            buy_point = BuyPoint(
+                type='一买',
+                idx=h.index[-1] - (n - 1 - recent_low_idx),  # 原始索引
+                price=recent_low,
+                confidence=0.7,
+                reason=f'一买：MACD 底背离 + 价格新低（{recent_low:.2f}）+ {len(zhongshus)} 个中枢',
+                extra={'low_idx': recent_low_idx, 'low_price': recent_low}
+            )
 
-        # 更新状态机
-        state["last_one_buy_idx"] = buy_point.idx
-        state["last_one_buy_low"] = recent_low
+            # 更新状态机
+            state["last_one_buy_idx"] = buy_point.idx
+            state["last_one_buy_low"] = recent_low
+            # 修复 bug 1: 记录一买的时间戳，用于二买的过期判断
+            state["last_one_buy_time_idx"] = work_start_idx + recent_low_idx
 
-        return buy_point, state
+            return buy_point, state
+        # else: 不是真新低（同价或更高），跳过
 
     # === 二买检测（需要状态机有上次一买位置）===
     last_one_buy_idx = state.get("last_one_buy_idx", -1)
     last_one_buy_low = state.get("last_one_buy_low", float('inf'))
+    last_one_buy_time_idx = state.get("last_one_buy_time_idx", -1)
 
-    if last_one_buy_idx >= 0:
+    # 修复 bug 1: 二买只在一买后 60 根 K 线（约 3 个月）内有效
+    # 防止 2014-05 的一买低点用到 2026 年
+    TWO_BUY_MAX_WINDOW = 60
+    time_window_ok = (
+        last_one_buy_time_idx >= 0 and
+        (work_start_idx + (n - 1) - last_one_buy_time_idx) <= TWO_BUY_MAX_WINDOW
+    )
+
+    if last_one_buy_idx >= 0 and time_window_ok:
         _, _, hist = calc_macd(c)
 
         # 二买条件：
@@ -578,28 +599,31 @@ def detect_buy_point(
     # 3. 当前低点 >= 中枢上沿（回踩不跌回中枢）
     # 4. 放量
 
-    if zhongshus:
-        # 找最近一个中枢（按 end_idx 排序取最后）
-        latest_zhongshu = max(zhongshus, key=lambda z: z.end_idx)
-        ZG = latest_zhongshu.high
+    # 修复 bug 3: 无中枢时直接返回（max() 空序列会抛 ValueError）
+    if not zhongshus:
+        return None, state
 
-        current_close = c.iloc[-1]
-        current_low = l.iloc[-1]
+    # 找最近一个中枢（按 end_idx 排序取最后）
+    latest_zhongshu = max(zhongshus, key=lambda z: z.end_idx)
+    ZG = latest_zhongshu.high
 
-        broke_up = current_close > ZG           # 突破中枢上沿
-        hold_above = current_low >= ZG * 0.99   # 回踩不跌回（允许 1% 容差）
-        amplified = _is_volume_amplified(volumes, lookback=20) if volumes is not None else False
+    current_close = c.iloc[-1]
+    current_low = l.iloc[-1]
 
-        if broke_up and hold_above and amplified:
-            buy_point = BuyPoint(
-                type='三买',
-                idx=h.index[-1],
-                price=c.iloc[-1],
-                confidence=0.8,
-                reason=f'三买：突破中枢上沿（{ZG:.2f}）+ 放量 + 未跌回中枢',
-                extra={'zhongshu_end_idx': latest_zhongshu.end_idx, 'ZG': ZG}
-            )
-            return buy_point, state
+    broke_up = current_close > ZG           # 突破中枢上沿
+    hold_above = current_low >= ZG * 0.99   # 回踩不跌回（允许 1% 容差）
+    amplified = _is_volume_amplified(volumes, lookback=20) if volumes is not None else False
+
+    if broke_up and hold_above and amplified:
+        buy_point = BuyPoint(
+            type='三买',
+            idx=h.index[-1],
+            price=c.iloc[-1],
+            confidence=0.8,
+            reason=f'三买：突破中枢上沿（{ZG:.2f}）+ 放量 + 未跌回中枢',
+            extra={'zhongshu_end_idx': latest_zhongshu.end_idx, 'ZG': ZG}
+        )
+        return buy_point, state
 
     return None, state
 
