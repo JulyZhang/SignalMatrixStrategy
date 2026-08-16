@@ -5,14 +5,14 @@
 import pandas as pd
 from strategy.utils.indicators import calc_ema, calc_macd
 
-# 关键阈值（与设计文档第 2 节一致）
-MA_CONVERGENCE_THRESHOLD = 0.005   # 0.5% 均线粘合
-VOLATILITY_DECLINE_RATIO = 0.7     # 波动率下降至 0.7 倍
+# 关键阈值（与设计文档第 2 节一致；修复后更严格）
+MA_CONVERGENCE_THRESHOLD = 0.003   # 修复：原 0.005 太宽松，正常上涨初期也触发
+VOLATILITY_DECLINE_RATIO = 0.5     # 修复：原 0.7 太宽松，慢牛也触发中阴态
 
 
 def _check_zhongyintai(close: pd.Series, weekly_close: pd.Series) -> bool:
-    """中阴态触发检查（任一即触发）"""
-    # 周线 MA 收敛度
+    """中阴态触发检查（修复后）：周线收敛 + 日线 ATR 衰减 + 横盘 fallback"""
+    # 检查 1: 周线 MA 收敛度
     ema20_w = weekly_close.ewm(span=20, adjust=False).mean()
     ema60_w = weekly_close.ewm(span=60, adjust=False).mean()
     if len(ema20_w) > 0 and len(ema60_w) > 0:
@@ -20,7 +20,7 @@ def _check_zhongyintai(close: pd.Series, weekly_close: pd.Series) -> bool:
         if convergence < MA_CONVERGENCE_THRESHOLD:
             return True
 
-    # 日线 ATR 下降
+    # 检查 2: 日线 ATR 下降
     if len(close) >= 70:
         high = close * 1.01
         low = close * 0.99
@@ -28,6 +28,16 @@ def _check_zhongyintai(close: pd.Series, weekly_close: pd.Series) -> bool:
         atr_long = _calc_atr_simple(high, low, close, 50)
         if atr_long > 0 and atr_recent / atr_long < VOLATILITY_DECLINE_RATIO:
             return True
+
+    # 检查 3（新增 fallback）: 长期横盘 —— 20 日波幅 / 中位价 < 5%
+    if len(close) >= 20:
+        rolling_high = close.rolling(window=20).max().iloc[-1]
+        rolling_low = close.rolling(window=20).min().iloc[-1]
+        median_price = close.tail(20).median()
+        if median_price > 0:
+            range_ratio = (rolling_high - rolling_low) / median_price
+            if range_ratio < 0.05:   # 20 日内波幅 < 5%
+                return True
 
     return False
 
@@ -43,17 +53,39 @@ def _calc_atr_simple(high, low, close, period):
 
 
 def _check_guandian(close: pd.Series) -> bool:
-    """拐点市判定：底背离 + MSS 已完成（简化版）"""
+    """拐点市判定（修复后）：主判定 + fallback 判定，任一即触发"""
     if len(close) < 60:
         return False
     _, _, hist = calc_macd(close)
-    # 简化：MACD_hist 在零轴下方但连续 3 期上升
-    recent_hist = hist.tail(10)
-    if len(recent_hist) < 10:
+
+    # 主判定：MACD_hist 长期负值后开始反转（修复：放宽周期与严格度）
+    recent_hist = hist.tail(15)  # 修复：10 → 15
+    if len(recent_hist) < 15:
         return False
-    if (recent_hist < 0).all() and recent_hist.is_monotonic_increasing:
-        return True
-    return False
+
+    # 主判定条件 A：长期负值（≥ 10 期 < 0） + 最近 5 期反转（至少 3 期递增）
+    negative_count = sum(1 for v in recent_hist.iloc[:-5] if v < 0)
+    recent_5 = recent_hist.iloc[-5:]
+    increasing_count = sum(1 for i in range(1, len(recent_5)) if recent_5.iloc[i] > recent_5.iloc[i-1])
+
+    main_condition = (negative_count >= 10 and increasing_count >= 3)
+
+    # Fallback 判定：MACD_hist 由负转正 + 价格短期反弹 ≥ 5%
+    if not main_condition and len(close) >= 10:
+        # MACD_hist 在最近 3 期内至少 1 次由负转正
+        hist_recent_3 = hist.tail(3)
+        macd_turn = any(
+            hist_recent_3.iloc[i-1] < 0 and hist_recent_3.iloc[i] >= 0
+            for i in range(1, len(hist_recent_3))
+        )
+        # 价格 5 日涨幅 ≥ 5%
+        pct_change_5d = (close.iloc[-1] - close.iloc[-5]) / close.iloc[-5] if len(close) >= 5 else 0
+        price_rebound = pct_change_5d >= 0.05
+
+        if macd_turn and price_rebound:
+            return True
+
+    return main_condition
 
 
 def _check_trending(close: pd.Series) -> bool:
