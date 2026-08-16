@@ -143,13 +143,16 @@ def build_expectation_card(
     )
 
 
+_EPSILON_RR = 1e-9
+
+
 def validate_card(card: ExpectationCard) -> bool:
     """最低有效性校验（漏洞 V 场景自适应）"""
     # 场景自适应最低 RR
     min_rr = 1.0 if card.scene == "震荡市" else 1.5
 
     return (
-        card.risk_reward_ratio >= min_rr
+        card.risk_reward_ratio >= min_rr - _EPSILON_RR   # 浮点容差
         and card.confidence >= 0.5
         and card.expected_value > 0
     )
